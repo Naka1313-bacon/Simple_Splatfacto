@@ -1,4 +1,4 @@
-# [Simple_Splatofacto].(https://github.com/Naka1313-bacon/Simple_Splatfacto/)
+# [Simple_Splatofacto](https://github.com/Naka1313-bacon/Simple_Splatfacto/).
 This is the code simplified Splatofacto by nerfstudio and added an implementation creating mesh. 
 
 # Install
