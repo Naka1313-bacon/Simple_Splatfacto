@@ -25,10 +25,8 @@ from typing import Dict, List, Optional, Tuple, Type, Union
 
 import numpy as np
 import torch
-from gsplat._torch_impl import quat_to_rotmat
-from gsplat.project_gaussians import project_gaussians
-from gsplat.rasterize import rasterize_gaussians
-from gsplat.sh import num_sh_bases, spherical_harmonics
+from gsplat.rendering import rasterization
+from gsplat.cuda._wrapper import spherical_harmonics
 from pytorch_msssim import SSIM
 from torch.nn import Parameter
 from typing_extensions import Literal
@@ -36,6 +34,57 @@ from plyfile import PlyData, PlyElement
 import numpy as np
 import open3d as o3d
 
+def num_sh_bases(degree: int):
+    if degree == 0:
+        return 1
+    if degree == 1:
+        return 4
+    if degree == 2:
+        return 9
+    if degree == 3:
+        return 16
+    return
+def get_viewmat(optimized_camera_to_world):
+    """
+    function that converts c2w to gsplat world2camera matrix, using compile for some speed
+    """
+    R = optimized_camera_to_world[:, :3, :3]  # 3 x 3
+    T = optimized_camera_to_world[:, :3, 3:4]  # 3 x 1
+    # flip the z and y axes to align with gsplat conventions
+    R = R * torch.tensor([[[1, -1, -1]]], device=R.device, dtype=R.dtype)
+    # analytic matrix inverse to get world2camera matrix
+    R_inv = R.transpose(1, 2)
+    T_inv = -torch.bmm(R_inv, T)
+    viewmat = torch.zeros(R.shape[0], 4, 4, device=R.device, dtype=R.dtype)
+    viewmat[:, 3, 3] = 1.0  # homogenous
+    viewmat[:, :3, :3] = R_inv
+    viewmat[:, :3, 3:4] = T_inv
+    return viewmat
+
+
+def normalized_quat_to_rotmat(quat):
+    assert quat.shape[-1] == 4, quat.shape
+    w, x, y, z = torch.unbind(quat, dim=-1)
+    mat = torch.stack(
+        [
+            1 - 2 * (y**2 + z**2),
+            2 * (x * y - w * z),
+            2 * (x * z + w * y),
+            2 * (x * y + w * z),
+            1 - 2 * (x**2 + z**2),
+            2 * (y * z - w * x),
+            2 * (x * z - w * y),
+            2 * (y * z + w * x),
+            1 - 2 * (x**2 + y**2),
+        ],
+        dim=-1,
+    )
+    return mat.reshape(quat.shape[:-1] + (3, 3))
+
+
+def quat_to_rotmat(quat):
+    assert quat.shape[-1] == 4, quat.shape
+    return normalized_quat_to_rotmat(F.normalize(quat, dim=-1))
 
 
 def rescale_output_resolution(
@@ -634,17 +683,11 @@ class SplatModel(torch.nn.Module):
                                                              fx=camera_data['fx'],fy=camera_data['fy'],
                                                              cx=camera_data['cx'],cy=camera_data['cy'],
                                                              h=camera_data['height'],w=camera_data['width'])
-        R = c2w[:3, :3]  # 3 x 3
-        T = c2w[:3, 3:4]  # 3 x 1
-        # flip the z and y axes to align with gsplat conventions
-        R_edit = torch.diag(torch.tensor([1, -1, -1], device=self.device, dtype=R.dtype))
-        R = R @ R_edit
-        # analytic matrix inverse to get world2camera matrix
-        R_inv = R.T
-        T_inv = -R_inv @ T
-        viewmat = torch.eye(4, device=R.device, dtype=R.dtype)
-        viewmat[:3, :3] = R_inv
-        viewmat[:3, 3:4] = T_inv
+        K = torch.Tensor([
+        [fx, 0, cx],
+        [0, fy, cy],
+        [0, 0, 1]]).to('cuda')
+        view_mat = get_viewmat(c2w.unsqueeze(dim=0))
         self.last_size = (H, W)
         
         BLOCK_X = 16
@@ -666,26 +709,6 @@ class SplatModel(torch.nn.Module):
 
         colors_crop = torch.cat((features_dc_crop[:, None, :], features_rest_crop), dim=1)
 
-       
-        self.xys, depths, self.radii, conics, comp,num_tiles_hit, cov3d = project_gaussians(  # type: ignore
-            means_crop,
-            torch.exp(scales_crop),
-            1,
-            quats_crop / quats_crop.norm(dim=-1, keepdim=True),
-            viewmat.squeeze()[:3, :],
-            fx,
-            fy,
-            cx,
-            cy,
-            H,
-            W,
-            BLOCK_X,
-        )  # type: ignore
-        if (self.radii).sum() == 0:
-            return {"rgb": background.repeat((H, W), 1)}
-
-        if self.training:
-            self.xys.retain_grad()
 
         if self.config.sh_degree > 0:
             viewdirs = means_crop.detach() - c2w.detach()[:3, 3]  # (N, 3)
@@ -698,40 +721,31 @@ class SplatModel(torch.nn.Module):
 
         
         assert (num_tiles_hit > 0).any()  # type: ignore
-        rgb,alpha = rasterize_gaussians(  # type: ignore
-            self.xys,
-            depths,
-            self.radii,
-            conics,
-            num_tiles_hit,  # type: ignore
-            rgbs,
-            torch.sigmoid(opacities_crop) * comp[:,None],
-            H,
-            W,
-            BLOCK_X,
-            background=background,
-            return_alpha=True
-        )  # type: ignore
-        alpha = alpha[..., None]
-        rgb = torch.clamp(rgb, max=1.0)  # type: ignore
-        depth_im = None
-        if not self.training:
-            depth_im = rasterize_gaussians(  # type: ignore
-                self.xys,
-                depths,
-                self.radii,
-                conics,
-                num_tiles_hit,  # type: ignore
-                depths[:, None].repeat(1, 3),
-                torch.sigmoid(opacities_crop),
-                H,
-                W,
-                BLOCK_X,
-                background=torch.zeros(3, device=self.device),
-            )[..., 0:1]  # type: ignore
-            
-            depth_im = torch.where(alpha > 0, depth_im / alpha, depth_im.detach().max())
-        return {"rgb": rgb, "depth": depth_im, "alpha": alpha}  # type: ignore
+        render_colors,render_alpha,meta = rasterization(
+            means=means_crop,
+            quats=quats_crop / quats_crop.norm(dim=-1, keepdim=True),
+            scales=torch.exp(scales_crop),
+            opacities=torch.sigmoid(opacities_crop).squeeze(-1),
+            colors=rgbs,
+            viewmats=view_mat,  # [C, 4, 4]
+            Ks=K.unsqueeze(dim=0),  # [C, 3, 3]
+            width=W,
+            height=H,
+            packed=False,
+            absgrad=False,
+            sparse_grad=False,
+            rasterize_mode='classic',
+            render_mode='RGB+ED'
+        )
+        self.radii = meta['radii']
+        self.xys = meta['means2d']
+        self.xys.retain_grad()
+        alpha = render_alpha[:, ...]
+        rgb = render_colors[:,:, :, :3] + (1 - alpha) * background
+        rgb = torch.clamp(rgb, 0.0, 1.0)
+        depth_im = render_colors[:, :, :, 3:4].reshape(H,W,1)
+        depth_im = torch.where(alpha > 0, depth_im, depth_im.detach().max()).squeeze(0)
+        return {"rgb": rgb, "depth": depth_im, "alpha": render_alpha}  # type: ignore
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
