@@ -3,7 +3,7 @@ This is the code simplified Splatofacto by nerfstudio and added an implementatio
 
 # Install
 ```bash
-pip install plyfile gsplat torchmetrics torchvision scikit-learn pytorch-msssim ninja open3d
+pip install plyfile pymeshlab trimesh vdbfusion gsplat==1.0.0 torch==2.2.1 torchmetrics torchvision scikit-learn pytorch-msssim ninja open3d
 ```
 # Run
 ```bash
