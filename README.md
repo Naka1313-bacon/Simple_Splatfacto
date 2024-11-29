@@ -10,8 +10,12 @@ pip install plyfile pymeshlab trimesh vdbfusion gsplat==1.0.0 torch==2.2.1 torch
 python main.py --camera_data_path 'your_colmap_folder/cameras.bin' \
                 --image_data_path 'your_colmap_folder/images.bin' \
                 --image_path 'your_image_folder/*' \
-                --sparse_model_path 'your_colmap_folder/filter_model.ply' \
-                --max_steps 30000 \
+                --sparse_model_path 'your_colmap_folder/model.ply' \
+                --max_steps 4000 \
+                --cull_alpha_thresh 0.005 \
+                --n_split_samples 2 \
+                --sh_degree 3 \
+                --stop_split_at 3000
                 
 ```
 You can customize the other parameters, please refer the file opt.py.
